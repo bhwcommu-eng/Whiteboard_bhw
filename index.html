@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multiplayer Whiteboard</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; flex-direction: column; font-family: ui-sans-serif, system-ui, -apple-system; background:#fff; color:#111; }
+    #toolbar { display:flex; gap:12px; align-items:center; padding:10px; border-bottom:1px solid #e5e7eb; }
+    #canvasWrap { position:relative; flex:1; }
+    canvas { position:absolute; inset:0; width:100%; height:100%; cursor: crosshair; touch-action: none; }
+    .hint { color:#6b7280; font-size:12px; }
+    .spacer { flex:1; }
+    button, input, select, label { font-size:14px; }
+    button { border:1px solid #d1d5db; background:#f9fafb; padding:6px 10px; border-radius:8px; }
+    button:hover { background:#f3f4f6; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <label>สี <input type="color" id="color" value="#000000" /></label>
+    <label>ขนาด <input type="range" id="size" min="1" max="40" value="3" /></label>
+    <button id="mode">✏️ ปากกา</button>
+    <button id="clear">🧹 ล้างทั้งกระดาน</button>
+    <div class="spacer"></div>
+    <div class="hint">Pan: กด Space หรือคลิกขวาแล้วลาก · Zoom: หมุนล้อเมาส์ · ยางลบ: กด E</div>
+  </div>
+  <div id="canvasWrap">
+    <canvas id="board"></canvas>
+  </div>
+
+  <!-- Socket.IO client CDN -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+  <script>
+  (function(){
+    // ----- Socket -----
+    const socket = io(); // เชื่อมต่อไปยัง origin เดียวกับที่เสิร์ฟไฟล์นี้
+
+    // ----- Canvas / HiDPI -----
+    const canvas = document.getElementById('board');
+    const ctx = canvas.getContext('2d');
+    const DPR = window.devicePixelRatio || 1;
+
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.floor(rect.width * DPR);
+      canvas.height = Math.floor(rect.height * DPR);
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0); // ให้พิกเซล = CSS px
+      redraw();
+    }
+    window.addEventListener('resize', resize);
+
+    // ----- World transform (pan/zoom) -----
+    let scale = 1;           // ระดับซูม
+    let offsetX = 0, offsetY = 0; // การแพนในหน่วย CSS px
+
+    // ----- Tools / UI -----
+    const colorEl = document.getElementById('color');
+    const sizeEl  = document.getElementById('size');
+    const modeBtn = document.getElementById('mode');
+    const clearBtn= document.getElementById('clear');
+    let eraseMode = false;
+
+    modeBtn.onclick = () => {
+      eraseMode = !eraseMode;
+      modeBtn.textContent = eraseMode ? '🩹 ยางลบ' : '✏️ ปากกา';
+      canvas.style.cursor = eraseMode ? 'not-allowed' : 'crosshair';
+    };
+    document.addEventListener('keydown', (e)=>{ if (e.key.toLowerCase()==='e') modeBtn.click(); });
+    clearBtn.onclick = () => socket.emit('clear');
+
+    // ----- Stroke store -----
+    const strokes = []; // [{id, points:[x,y,...], color, size, erased, t}, ...]
+
+    // ----- Coords convert -----
+    function screenToWorld(x, y) {
+      const rect = canvas.getBoundingClientRect();
+      const sx = x - rect.left - offsetX;
+      const sy = y - rect.top  - offsetY;
+      return { x: sx / scale, y: sy / scale };
+    }
+
+    // ----- Draw helpers -----
+    function drawStroke(s) {
+      if (!s.points || s.points.length < 4) return;
+      ctx.save();
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(scale, scale);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = s.size;
+      if (s.erased) {
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.strokeStyle = 'rgba(0,0,0,1)';
+      } else {
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.strokeStyle = s.color || '#000';
+      }
+      ctx.beginPath();
+      ctx.moveTo(s.points[0], s.points[1]);
+      for (let i=2; i<s.points.length; i+=2) ctx.lineTo(s.points[i], s.points[i+1]);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function redraw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      for (const s of strokes) drawStroke(s);
+      if (drawing && current.points.length) drawStroke(current);
+    }
+
+    // ----- Draw / Pan / Zoom state -----
+    let drawing = false;
+    let panning = false;
+    let lastX = 0, lastY = 0;
+    let current = { points: [], color: '#000', size: 3, erased: false, t: 0 };
+    let spaceDown = false;
+
+    document.addEventListener('keydown', (e)=>{
+      if (e.code === 'Space') { spaceDown = true; canvas.style.cursor = 'grab'; }
+    });
+    document.addEventListener('keyup', (e)=>{
+      if (e.code === 'Space') { spaceDown = false; canvas.style.cursor = eraseMode ? 'not-allowed' : 'crosshair'; }
+    });
+
+    function startStroke(x, y) {
+      drawing = true;
+      const w = screenToWorld(x, y);
+      current = {
+        id: cryptoRandomId(),
+        points: [w.x, w.y],
+        color: colorEl.value,
+        size: parseInt(sizeEl.value, 10),
+        erased: eraseMode,
+        t: Date.now()
+      };
+      redraw();
+    }
+    function extendStroke(x, y) {
+      if (!drawing) return;
+      const w = screenToWorld(x, y);
+      current.points.push(w.x, w.y);
+      // วาดทันทีให้ลื่น
+      drawStroke(current);
+    }
+    function endStroke() {
+      if (!drawing) return;
+      drawing = false;
+      if (current.points.length >= 4) {
+        strokes.push(current);
+        socket.emit('stroke', current);
+      }
+      current = { points: [], color: colorEl.value, size: parseInt(sizeEl.value,10), erased: eraseMode, t: 0 };
+      redraw();
+    }
+
+    // ----- Mouse -----
+    function onWheel(e) {
+      e.preventDefault();
+      const delta = Math.sign(e.deltaY);
+      const zoomFactor = 1.1;
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const worldBefore = { x: (mx - offsetX) / scale, y: (my - offsetY) / scale };
+      if (delta > 0) scale /= zoomFactor; else scale *= zoomFactor;
+      scale = Math.max(0.1, Math.min(8, scale));
+      const screenAfterX = worldBefore.x * scale + offsetX;
+      const screenAfterY = worldBefore.y * scale + offsetY;
+      offsetX += (mx - screenAfterX);
+      offsetY += (my - screenAfterY);
+      redraw();
+    }
+    function onDown(e) {
+      const isRight = e.button === 2;
+      if (spaceDown || isRight) {
+        panning = true; lastX = e.clientX; lastY = e.clientY; canvas.style.cursor = 'grabbing';
+      } else {
+        startStroke(e.clientX, e.clientY);
+      }
+    }
+    function onMove(e) {
+      if (panning) {
+        offsetX += e.clientX - lastX; offsetY += e.clientY - lastY;
+        lastX = e.clientX; lastY = e.clientY; redraw();
+      } else if (drawing) {
+        extendStroke(e.clientX, e.clientY);
+      }
+    }
+    function onUp() {
+      if (panning) { panning = false; canvas.style.cursor = spaceDown ? 'grab' : (eraseMode?'not-allowed':'crosshair'); }
+      else { endStroke(); }
+    }
+    canvas.addEventListener('contextmenu', (e)=> e.preventDefault());
+    canvas.addEventListener('mousedown', onDown);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    canvas.addEventListener('wheel', onWheel, { passive:false });
+
+    // ----- Touch (พื้นฐาน) -----
+    canvas.addEventListener('touchstart', (e)=>{
+      if (e.touches.length === 1) {
+        const t = e.touches[0]; startStroke(t.clientX, t.clientY);
+      } else if (e.touches.length === 2) {
+        panning = true; const t = e.touches[0]; lastX = t.clientX; lastY = t.clientY;
+      }
+    }, {passive:false});
+    canvas.addEventListener('touchmove', (e)=>{
+      e.preventDefault();
+      if (panning && e.touches.length>=1) {
+        const t=e.touches[0];
+        offsetX += t.clientX-lastX; offsetY += t.clientY-lastY;
+        lastX=t.clientX; lastY=t.clientY; redraw();
+      } else if (drawing && e.touches.length===1) {
+        const t=e.touches[0]; extendStroke(t.clientX, t.clientY);
+      }
+    }, {passive:false});
+    canvas.addEventListener('touchend', ()=>{
+      if (panning) panning=false;
+      if (drawing) endStroke();
+    });
+
+    // ----- Socket events -----
+    socket.on('init', (payload)=>{
+      strokes.length = 0;
+      if (payload && Array.isArray(payload.strokes)) strokes.push(...payload.strokes);
+      resize();
+    });
+    socket.on('stroke', (s)=>{ strokes.push(s); drawStroke(s); });
+    socket.on('cleared', ()=>{ strokes.length = 0; redraw(); });
+
+    // ----- Start -----
+    resize();
+
+    // ----- Helpers -----
+    function cryptoRandomId() {
+      if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+      return 'id-' + Math.random().toString(36).slice(2);
+    }
+  })();
+  </script>
+</body>
+</html>
